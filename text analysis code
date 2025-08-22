@@ -1,0 +1,195 @@
+
+CANDIDATE_ENCODINGS = [
+    "utf-8-sig", "utf-8",
+    "cp949", "ms949", "euc-kr",
+    "cp1252", "latin-1"
+]
+
+def normalize_ws(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+def read_text_any(path, normalize=True):
+    last_err = None
+    for enc in CANDIDATE_ENCODINGS:
+        try:
+            with open(path, "r", encoding=enc, errors="strict") as f:
+                t = f.read()
+            if normalize:
+                t = normalize_ws(t)
+            return t
+        except Exception as e:
+            last_err = e
+            continue
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        t = f.read()
+    if normalize:
+        t = normalize_ws(t)
+    print(f"[WARN] Fallback read with replacement: {path}  (last error: {last_err})")
+    return t
+
+
+print("Loading models (spaCy / BERT / SBERT / ROUGE)...")
+
+NLP = spacy.load("en_core_web_md")
+
+BERT_TOKENIZER = BertTokenizer.from_pretrained('bert-base-uncased')
+BERT_MODEL = BertModel.from_pretrained('bert-base-uncased')
+BERT_MODEL.eval()
+
+SBERT_MODEL = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+
+ROUGE_SCORER = rouge_scorer.RougeScorer(['rouge1','rouge2','rougeL'], use_stemmer=True)
+
+print("Models loaded.")
+
+def compare_texts_tfidf(text1, text2):
+    vec = TfidfVectorizer().fit_transform([text1, text2]).toarray()
+    sim = cosine_similarity(vec)[0, 1]
+    return sim * 100
+
+def preprocess_text_for_jaccard(text):
+    return set(re.findall(r'\b\w+\b', text.lower()))
+
+def jaccard_similarity(text1, text2):
+    s1 = preprocess_text_for_jaccard(text1)
+    s2 = preprocess_text_for_jaccard(text2)
+    if not s1 and not s2:
+        return 100.0
+    if not s1 or not s2:
+        return 0.0
+    return (len(s1 & s2) / len(s1 | s2)) * 100
+
+def compare_texts_spacy(text1, text2):
+    d1 = NLP(text1)
+    d2 = NLP(text2)
+    return d1.similarity(d2) * 100
+
+def compare_texts_bert(text1, text2, max_len=512):
+    inputs1 = BERT_TOKENIZER(text1, return_tensors='pt', truncation=True, max_length=max_len)
+    inputs2 = BERT_TOKENIZER(text2, return_tensors='pt', truncation=True, max_length=max_len)
+    with torch.no_grad():
+        out1 = BERT_MODEL(**inputs1).last_hidden_state.mean(dim=1)
+        out2 = BERT_MODEL(**inputs2).last_hidden_state.mean(dim=1)
+        sim = torch.nn.functional.cosine_similarity(out1, out2).item()
+    return sim * 100
+
+def compare_texts_sbert(text1, text2):
+    emb = SBERT_MODEL.encode([text1, text2], convert_to_tensor=True, normalize_embeddings=True)
+    sim = util.cos_sim(emb[0], emb[1]).item()
+    return sim * 100
+
+def rouge_scores(text1, text2):
+    s = ROUGE_SCORER.score(text1, text2)
+    return {
+        "rouge1_f1": s["rouge1"].fmeasure * 100,
+        "rouge2_f1": s["rouge2"].fmeasure * 100,
+        "rougeL_f1": s["rougeL"].fmeasure * 100,
+    }
+
+
+def discover_sections_B(product_path):
+    sections = []
+    for sub in sorted(os.listdir(product_path)):
+        sub_path = os.path.join(product_path, sub)
+        if os.path.isdir(sub_path):
+            m = re.search(r'(\d+)', sub)  # Section_1, sec1, 1 등에서 숫자 추출
+            idx = int(m.group(1)) if m else 9999
+            sections.append((idx, sub_path))
+    sections.sort(key=lambda x: (x[0], x[1]))
+    return sections
+
+PRODUCTS = [
+    'Apple Watch',
+    'Apple MacBook',
+    'Apple Mac mini',
+    'Apple AirPod Max',
+]
+
+def process_reviews(base_folder, output_excel, normalize_whitespace=True):
+    rows = []
+    total_pairs = 0
+
+    if not os.path.isdir(base_folder):
+        raise FileNotFoundError(f"base_folder not found: {base_folder}")
+
+    study_folders = [d for d in os.listdir(base_folder) if os.path.isdir(os.path.join(base_folder, d))]
+    if not study_folders:
+        print(f"[WARN] No study folders found under: {base_folder}")
+
+    for study in sorted(study_folders):
+        study_path = os.path.join(base_folder, study)
+        print(f"\n[STUDY] {study}")
+
+        for product in PRODUCTS:
+            product_path = os.path.join(study_path, product)
+            if not os.path.isdir(product_path):
+                print(f"  - Missing product folder: {product}")
+                continue
+
+            sections = discover_sections_B(product_path)
+            if not sections:
+                print(f"  - No section folders in {product}, skipping...")
+                continue
+
+            for sec_idx, sec_path in sections:
+                gpt_path = os.path.join(sec_path, f"gpt_section_{sec_idx}.txt")
+                if not os.path.isfile(gpt_path):
+                    print(f"    * Missing gpt file: {gpt_path}, skipping this section.")
+                    continue
+            
+                gpt_text = read_text_any(gpt_path, normalize=normalize_whitespace)
+
+                for who in ["human1", "human2", "human3"]:
+                    human_path = os.path.join(sec_path, f"{who}_section_{sec_idx}.txt")
+                    if not os.path.isfile(human_path):
+                        print(f"    * Missing {who} file: {human_path}, skipping this pair.")
+                        continue
+
+                    human_text = read_text_any(human_path, normalize=normalize_whitespace)
+                   
+                    try: tfidf = compare_texts_tfidf(human_text, gpt_text)
+                    except: tfidf = None
+                    try: jacc = jaccard_similarity(human_text, gpt_text)
+                    except: jacc = None
+                    try: spacy_sim = compare_texts_spacy(human_text, gpt_text)
+                    except: spacy_sim = None
+                    try: bert = compare_texts_bert(human_text, gpt_text)
+                    except: bert = None
+                    try: sbert = compare_texts_sbert(human_text, gpt_text)
+                    except: sbert = None
+                    try: r = rouge_scores(human_text, gpt_text)
+                    except: r = {"rouge1_f1": None, "rouge2_f1": None, "rougeL_f1": None}
+
+                    rows.append({
+                        "study_name": study,
+                        "product": product,
+                        "section_index": sec_idx,
+                        "who": who,
+                        "tfidf": tfidf,
+                        "jaccard": jacc,
+                        "spacy": spacy_sim,
+                        "bert": bert,
+                        "sbert": sbert,
+                        "rouge1_f1": r["rouge1_f1"],
+                        "rouge2_f1": r["rouge2_f1"],
+                        "rougeL_f1": r["rougeL_f1"],
+                        "human_path": human_path,
+                        "gpt_path": gpt_path,
+                    })
+                    total_pairs += 1
+
+    df = pd.DataFrame(rows)
+    df.to_excel(output_excel, index=False)
+    print(f"\nDone. Pairs compared: {total_pairs}")
+    print(f"Saved: {output_excel}")
+    return df
+
+
+base_folder = "/content/Tables_split"   # <-- 필요 시 변경
+output_excel = "/content/text_comparison.xlsx"
+df = process_reviews(base_folder, output_excel)
+
+display(df.head())
