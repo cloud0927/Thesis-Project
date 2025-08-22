@@ -1,0 +1,81 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+path = "/text_comparison.xlsx"  
+df = pd.read_excel(path)
+
+embedding_metrics = ["tfidf", "jaccard", "sbert", "bert", "spacy"]
+embedding_labels  = ["TF-IDF","Jaccard","Sentence-BERT","BERT","spaCy"]
+
+rouge_metrics = ["rouge1_f1","rouge2_f1","rougeL_f1"]
+rouge_labels  = ["ROUGE-1 F1","ROUGE-2 F1","ROUGE-L F1"]
+
+def mean_and_sem(group: pd.DataFrame, metric_cols):
+    out = {}
+    for m in metric_cols:
+        s = group[m]
+        n = s.notna().sum()
+        mean = s.mean()
+        sem = (s.std(ddof=1) / np.sqrt(n)) if n > 1 else (0.0 if n == 1 else np.nan)
+        out[f"{m}_mean"] = mean
+        out[f"{m}_sem"]  = sem
+    return pd.Series(out)
+
+metrics_all = embedding_metrics + rouge_metrics
+section_summary = (
+    df.groupby(["product", "section_index"], as_index=False)
+      .apply(lambda g: mean_and_sem(g, metrics_all))
+      .reset_index(drop=True)
+)
+
+custom_titles = {
+    1: "Study characteristics",
+    2: "Patient characteristics",
+    3: "Intervention",
+    4: "Comparison/Control",
+    5: "Follow-up",
+    6: "Outcome measures and effect size",
+    7: "Comments",
+    8: "Other"
+}
+
+for product in section_summary["product"].unique():
+    subset = section_summary[section_summary["product"] == product].sort_values("section_index")
+    sections = subset["section_index"].tolist()
+    x = np.arange(len(sections))
+    bar_width = 0.15
+    
+    plt.figure(figsize=(12,6))
+    for i, metric in enumerate(embedding_metrics):
+        means = subset[f"{metric}_mean"].to_numpy()
+        sems  = subset[f"{metric}_sem"].to_numpy()
+        plt.bar(x + i*bar_width, means, bar_width, yerr=sems, capsize=3, label=embedding_labels[i])
+    
+    plt.title(f"{product} - Section-level Similarity (Embedding-based metrics)")
+    plt.ylabel("Similarity (%)")
+    plt.xticks(x + bar_width*len(embedding_metrics)/2, [custom_titles.get(s, f"Section {s}") for s in sections], rotation=20)
+    plt.legend(loc="upper left", bbox_to_anchor=(1.0,1.0))
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+for product in section_summary["product"].unique():
+    subset = section_summary[section_summary["product"] == product].sort_values("section_index")
+    sections = subset["section_index"].tolist()
+    x = np.arange(len(sections))
+    bar_width = 0.25
+    
+    plt.figure(figsize=(12,6))
+    for i, metric in enumerate(rouge_metrics):
+        means = subset[f"{metric}_mean"].to_numpy()
+        sems  = subset[f"{metric}_sem"].to_numpy()
+        plt.bar(x + i*bar_width, means, bar_width, yerr=sems, capsize=3, label=rouge_labels[i])
+    
+    plt.title(f"{product} - Section-level Similarity (ROUGE metrics)")
+    plt.ylabel("Similarity (%)")
+    plt.xticks(x + bar_width*len(rouge_metrics)/2, [custom_titles.get(s, f"Section {s}") for s in sections], rotation=20)
+    plt.legend(loc="upper left", bbox_to_anchor=(1.0,1.0))
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
