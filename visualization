@@ -30,14 +30,10 @@ section_summary = (
 )
 
 custom_titles = {
-    1: "Study characteristics",
-    2: "Patient characteristics",
-    3: "Intervention",
-    4: "Comparison/Control",
-    5: "Follow-up",
-    6: "Outcome measures and effect size",
-    7: "Comments",
-    8: "Other"
+    1: "Executive Summary",
+    3: "Insights by 3 Product Features",
+    4: "Pros and Cons Summary",
+    5: "Recommendations",
 }
 
 for product in section_summary["product"].unique():
