@@ -1,0 +1,417 @@
+# =========================================
+# 0) Install packages (Colab)
+# =========================================
+!pip -q install openpyxl pingouin statsmodels seaborn
+
+import os, re, io, math, textwrap, warnings
+import numpy as np
+import pandas as pd
+from scipy import stats
+import statsmodels.api as sm
+from statsmodels.formula.api import mixedlm
+import pingouin as pg
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+plt.rcParams["figure.dpi"] = 140
+sns.set(style="whitegrid")
+warnings.filterwarnings("ignore")
+
+# =========================================
+# 1) Upload Excel
+# =========================================
+from google.colab import files
+print("upload (예: Human Assessment Table.xlsx)")
+uploaded = files.upload()
+XLS_NAME = list(uploaded.keys())[0]
+print("Loaded:", XLS_NAME)
+
+xls = pd.ExcelFile(XLS_NAME)
+
+# =========================================
+# 2) Read sheets (rubric, scores) & clean
+# =========================================
+def read_sheet_case_insensitive(xls, name):
+    # case-insensitive sheet fetch
+    candidates = [s for s in xls.sheet_names if s.strip().lower()==name]
+    if not candidates:
+        raise ValueError(f"'{name}' 시트를 찾을 수 없습니다. 시트명을 'rubric', 'scores'로 맞춰주세요.")
+    return pd.read_excel(xls, candidates[0])
+
+rubric = read_sheet_case_insensitive(xls, "rubric")
+scores = read_sheet_case_insensitive(xls, "scores")
+
+# normalize column names: lower + strip
+rubric.columns = [c.strip().lower() for c in rubric.columns]
+scores.columns = [c.strip().lower() for c in scores.columns]
+
+# your screenshots show: 
+# rubric: section_index, section_name, criterion_id, criterion_label, max_score
+# scores: product, author, rater, section_index(or section_inde), criterion_id, score
+
+# fix possible typo: section_inde -> section_index
+for df in [rubric, scores]:
+    if "section_index" not in df.columns:
+        # find a column that startswith 'section_inde'
+        matches = [c for c in df.columns if c.startswith("section_inde")]
+        if matches:
+            df.rename(columns={matches[0]: "section_index"}, inplace=True)
+
+required_rubric = {"section_index","criterion_id","max_score"}
+required_scores = {"product","author","rater","section_index","criterion_id","score"}
+if not required_rubric.issubset(rubric.columns):
+    raise ValueError(f"rubric 시트 열 부족: {set(rubric.columns)}")
+if not required_scores.issubset(scores.columns):
+    raise ValueError(f"scores 시트 열 부족: {set(scores.columns)}")
+
+# types
+rubric["section_index"] = rubric["section_index"].astype(str)
+rubric["criterion_id"]  = rubric["criterion_id"].astype(str)
+rubric["max_score"]     = pd.to_numeric(rubric["max_score"], errors="coerce")
+
+scores["section_index"] = scores["section_index"].astype(str)
+scores["criterion_id"]  = scores["criterion_id"].astype(str)
+scores["score"]         = pd.to_numeric(scores["score"], errors="coerce")
+
+# create author_type
+scores["author_type"] = np.where(scores["author"].str.lower()=="llm", "llm", "human")
+
+# =========================================
+# 3) Section max points & section-level scores
+# =========================================
+# section_max = sum of max_score over criteria in a section
+sec_max = (rubric.groupby(["section_index"], as_index=False)["max_score"]
+                 .sum().rename(columns={"max_score":"section_max"}))
+
+# join to scores to compute section-level % per (product, author, rater)
+sec_scores = (scores.groupby(["product","author","author_type","rater",
+                              "section_index"], as_index=False)
+                     .agg(score_sum=("score","sum")))
+sec_scores = sec_scores.merge(sec_max, on="section_index", how="left")
+sec_scores["section_pct"] = sec_scores["score_sum"] / sec_scores["section_max"] * 100.0
+
+# section name map (optional)
+sec_names = None
+if "section_name" in rubric.columns:
+    sec_names = rubric.drop_duplicates("section_index")[["section_index","section_name"]]
+
+# =========================================
+# 4) Aggregate across raters → author-level section score
+#    HumanMean per product×section vs LLM per product×section
+# =========================================
+author_sec_mean = (sec_scores
+                   .groupby(["product","author","author_type","section_index"], as_index=False)
+                   .agg(section_pct_mean=("section_pct","mean")))
+
+# Human mean (across 3 humans)
+human_mean = (author_sec_mean[author_sec_mean["author_type"]=="human"]
+              .groupby(["product","section_index"], as_index=False)["section_pct_mean"]
+              .mean().rename(columns={"section_pct_mean":"human_mean_pct"}))
+
+# LLM mean (if LLM 한 명이면 그대로)
+llm_mean = (author_sec_mean[author_sec_mean["author_type"]=="llm"]
+            .groupby(["product","section_index"], as_index=False)["section_pct_mean"]
+            .mean().rename(columns={"section_pct_mean":"llm_pct"}))
+
+pair = human_mean.merge(llm_mean, on=["product","section_index"], how="inner")
+pair["delta"] = pair["llm_pct"] - pair["human_mean_pct"]
+pair.head()
+
+# =========================================
+# 5) Section-level summary across products: mean ± SEM
+# =========================================
+def sem(x):
+    x = pd.Series(x).dropna()
+    n = len(x)
+    if n<=1: return np.nan
+    return x.std(ddof=1)/np.sqrt(n)
+
+sec_summary = (pair.groupby("section_index", as_index=False)
+                    .agg(human_mean=("human_mean_pct","mean"),
+                         human_sem =("human_mean_pct", sem),
+                         llm_mean  =("llm_pct","mean"),
+                         llm_sem   =("llm_pct", sem),
+                         delta_mean=("delta","mean"),
+                         delta_sem =("delta", sem),
+                         n=("product","count")))
+
+if sec_names is not None:
+    sec_summary = sec_summary.merge(sec_names, on="section_index", how="left")
+sec_summary = sec_summary.sort_values("section_index", key=lambda s: s.astype(float))
+sec_summary
+
+# =========================================
+# 6) Paired tests (per section): t-test, Wilcoxon, Cohen's d, bootstrap CI
+# =========================================
+def bootstrap_ci_mean(a, n_boot=5000, alpha=0.05, seed=42):
+    rng = np.random.default_rng(seed)
+    a = np.asarray(a, dtype=float)
+    boots = rng.choice(a, size=(n_boot, a.size), replace=True).mean(axis=1)
+    lo = np.percentile(boots, 100*alpha/2)
+    hi = np.percentile(boots, 100*(1-alpha/2))
+    return lo, hi
+
+stat_rows = []
+for sec in sorted(pair["section_index"].unique(), key=lambda s: float(s)):
+    sub = pair[pair["section_index"]==sec]
+    d = sub["delta"].dropna()
+    if len(d)>=2:
+        t = stats.ttest_rel(sub["llm_pct"], sub["human_mean_pct"])
+        try:
+            w = stats.wilcoxon(d)
+        except Exception:
+            w = None
+        dbar = d.mean()
+        sd = d.std(ddof=1)
+        d_cohen = dbar/sd if sd>0 else np.nan
+        lo, hi = bootstrap_ci_mean(d) if len(d)>=3 else (np.nan,np.nan)
+        stat_rows.append({
+            "section_index": sec,
+            "n_pairs": len(d),
+            "mean_delta": dbar,
+            "ci95_lo_boot": lo,
+            "ci95_hi_boot": hi,
+            "ttest_t": t.statistic, "ttest_p": t.pvalue,
+            "wilcoxon_T": (w.statistic if w else np.nan),
+            "wilcoxon_p": (w.pvalue   if w else np.nan),
+            "cohen_d": d_cohen
+        })
+stats_table = pd.DataFrame(stat_rows)
+if sec_names is not None:
+    stats_table = stats_table.merge(sec_names, on="section_index", how="left")
+stats_table = stats_table.sort_values("section_index", key=lambda s: s.astype(float))
+stats_table
+
+# =========================================
+# 7) Winner map: per product×section, who is the best author?
+# =========================================
+# (rater-avg author scores 사용)
+topic_sec_author = (author_sec_mean
+                    .groupby(["product","section_index","author","author_type"], as_index=False)
+                    .agg(section_pct=("section_pct_mean","mean")))
+
+winners = (topic_sec_author.sort_values(["product","section_index","section_pct"],
+                                        ascending=[True,True,False])
+                          .groupby(["product","section_index"], as_index=False)
+                          .first()
+                          .rename(columns={"author":"winner","section_pct":"winner_pct"}))
+
+# wins count by section
+winner_counts = (winners.groupby(["section_index","winner"], as_index=False)
+                        .size().rename(columns={"size":"wins"}))
+
+if sec_names is not None:
+    winners = winners.merge(sec_names, on="section_index", how="left")
+    winner_counts = winner_counts.merge(sec_names, on="section_index", how="left")
+
+winners.head(), winner_counts.head()
+
+# =========================================
+# 8) Mixed-effects model (optional; controls rater/product effects)
+#     DV: section_pct (rater-level), Fixed: C(author_type)+C(section_index),
+#     Random: intercept by product, variance components by rater
+# =========================================
+mix_summary = None
+try:
+    df_m = sec_scores.dropna(subset=["section_pct"]).copy()
+    df_m["section_index"] = df_m["section_index"].astype(str)
+    md = sm.MixedLM.from_formula(
+        "section_pct ~ C(author_type) + C(section_index)",
+        groups="product",
+        vc_formula={"rater": "0 + C(rater)"},
+        re_formula="1",
+        data=df_m
+    )
+    mfit = md.fit(reml=True, method="lbfgs")
+    mix_summary = mfit.summary()
+    print(mix_summary)
+except Exception as e:
+    print("MixedLM failed:", e)
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+
+# sec_scores: (product, author, rater, section_index, section_pct) 가정
+g_rows = []
+
+def _get_rater_var(mfit):
+    """statsmodels MixedLMResults에서 rater 분산을 최대한 유연하게 추출"""
+    var_rater = 0.0
+    try:
+        vc = mfit.vcomp  # Series 또는 DataFrame
+        if isinstance(vc, pd.Series):
+            # 예: index가 ['rater Var', 'Group Var'] 등
+            idx = None
+            for i in vc.index:
+                if "rater" in str(i).lower():
+                    idx = i; break
+            if idx is not None:
+                var_rater = float(vc.loc[idx])
+        elif isinstance(vc, pd.DataFrame):
+            # 예: index='rater Var', column='Estimate' 형태
+            if "Estimate" in vc.columns:
+                cand = [i for i in vc.index if "rater" in str(i).lower()]
+                if cand:
+                    var_rater = float(vc.loc[cand[0], "Estimate"])
+            else:
+                # 열 이름이 없으면 단일 값일 수도
+                cand = [i for i in vc.index if "rater" in str(i).lower()]
+                if cand:
+                    var_rater = float(vc.loc[cand[0]])
+    except Exception:
+        pass
+    return var_rater
+
+for sec in sorted(sec_scores["section_index"].unique(), key=lambda s: float(s)):
+    sub = sec_scores[sec_scores["section_index"]==sec].dropna(subset=["section_pct"]).copy()
+    # 타깃 정의: 제품|작성자
+    sub["target"] = sub["product"].astype(str) + "|" + sub["author"].astype(str)
+
+    # 최소 요건: 타깃 ≥ 2, 채점자 ≥ 2
+    if sub["target"].nunique() < 2 or sub["rater"].nunique() < 2:
+        # print(f"[skip] section {sec}: targets={sub['target'].nunique()}, raters={sub['rater'].nunique()}")
+        continue
+
+    # 혼합모형 적합 (groups=target, VC=rater)
+    mfit = None
+    try:
+        md = sm.MixedLM.from_formula(
+            "section_pct ~ 1",
+            data=sub,
+            groups=sub["target"],            # 타깃 랜덤절편
+            vc_formula={"rater": "0 + C(rater)"},  # 채점자 분산성분
+            re_formula="1"
+        )
+        mfit = md.fit(reml=True, method="lbfgs")
+    except Exception:
+        # 다른 옵티마이저로 재시도
+        try:
+            mfit = md.fit(reml=True, method="nm", maxiter=200)
+        except Exception:
+            # print(f"[fail] section {sec} model fit")
+            continue
+
+    # 분산 성분 추출
+    try:
+        var_target = float(np.atleast_2d(mfit.cov_re)[0,0]) if mfit.cov_re is not None else np.nan
+    except Exception:
+        var_target = np.nan
+    var_rater  = _get_rater_var(mfit)
+    var_resid  = float(mfit.scale) if hasattr(mfit, "scale") else np.nan
+
+    # 평균 채점자 수 m (타깃별 고유 채점자 수의 평균; 자기평가 배제로 보통 2 근처)
+    m = sub.groupby("target")["rater"].nunique().mean()
+
+    # 일반화계수(신뢰도 유사치): G = σ²_target / (σ²_target + σ²_rater/m + σ²_resid/m)
+    if pd.notna(var_target) and pd.notna(var_resid) and m > 0:
+        G = var_target / (var_target + (var_rater/m) + (var_resid/m))
+        g_rows.append({"section_index": str(sec), "G_coeff": G, "m_avg_raters": m})
+
+# 결과 테이블
+if g_rows:
+    g_table = (pd.DataFrame(g_rows)
+                 .sort_values("section_index", key=lambda s: s.astype(float)))
+    display(g_table)
+else:
+    print("G-coefficient을 계산할 수 있는 섹션이 없습니다. (타깃≥2 & 채점자≥2 조건 미충족 또는 모델 적합 실패)")
+
+  # =========================================
+# 10) Save tables
+# =========================================
+os.makedirs("/content/outputs", exist_ok=True)
+pair.to_csv("/content/outputs/human_vs_llm_pairs.csv", index=False)
+sec_summary.to_csv("/content/outputs/section_summary_mean_sem.csv", index=False)
+stats_table.to_csv("/content/outputs/section_tests_effectsize.csv", index=False)
+winners.to_csv("/content/outputs/winners_by_product_section.csv", index=False)
+winner_counts.to_csv("/content/outputs/winner_counts_by_section.csv", index=False)
+if icc_table is not None:
+    icc_table.to_csv("/content/outputs/icc_by_section.csv", index=False)
+
+print("Saved tables to /content/outputs")
+
+
+# =========================================
+# 11) Figures
+# =========================================
+os.makedirs("/content/figs", exist_ok=True)
+
+# Helper: section label
+def sec_label(idx):
+    name = None
+    if sec_names is not None:
+        tmp = sec_names[sec_names["section_index"]==idx]
+        if not tmp.empty:
+            name = tmp.iloc[0]["section_name"]
+    return f"{idx}. {name}" if name else str(idx)
+
+# A) Bar: HumanMean vs LLM mean±SEM (across products), per section
+for _, r in sec_summary.iterrows():
+    s = r["section_index"]
+    lbl = sec_label(s)
+    fig, ax = plt.subplots(figsize=(5.5,4))
+    x = np.arange(2)
+    means = [r["human_mean"], r["llm_mean"]]
+    sems  = [r["human_sem"],  r["llm_sem"]]
+    ax.bar(x, means, yerr=sems, capsize=4, tick_label=["Human (mean of 3)","LLM"])
+    ax.set_ylabel("Section score (%)")
+    ax.set_title(f"{lbl} — mean ± SEM across products (n={int(r['n'])})")
+    ax.set_ylim(0, 100)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(f"/content/figs/bar_{s}.png")
+    plt.close()
+
+# B) Slope graph: per section, product-wise paired HumanMean→LLM
+for s in sorted(pair["section_index"].unique(), key=lambda x: float(x)):
+    sub = pair[pair["section_index"]==s].sort_values("product")
+    fig, ax = plt.subplots(figsize=(6,4.2))
+    for _, row in sub.iterrows():
+        ax.plot([0,1],[row["human_mean_pct"], row["llm_pct"]],
+                marker="o", linewidth=1.5, alpha=0.9, label=row["product"])
+    ax.set_xticks([0,1])
+    ax.set_xticklabels(["Human mean","LLM"])
+    ax.set_ylabel("Section score (%)")
+    ax.set_title(f"{sec_label(s)} — paired by product (n={len(sub)})")
+    ax.set_ylim(0,100)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    # legend outside
+    ax.legend(bbox_to_anchor=(1.02,1), loc="upper left", fontsize=8, ncol=1)
+    plt.tight_layout()
+    plt.savefig(f"/content/figs/slope_{s}.png", bbox_inches="tight")
+    plt.close()
+
+# C) Δ heatmap: rows=product, cols=section (LLM−HumanMean)
+delta_mat = pair.pivot(index="product", columns="section_index", values="delta").sort_index()
+plt.figure(figsize=(max(6, 0.6*delta_mat.shape[1]+2), 0.45*delta_mat.shape[0]+2.5))
+sns.heatmap(delta_mat, annot=True, fmt=".1f", center=0, cmap="RdBu_r", vmin=-20, vmax=20, cbar_kws={"label":"Δ (LLM − HumanMean) [%]"})
+plt.title("Delta heatmap by product × section")
+plt.ylabel("Product")
+plt.xlabel("Section")
+plt.tight_layout()
+plt.savefig("/content/figs/heatmap_delta.png")
+plt.close()
+
+# D) Winner map heatmap (who wins per cell)
+# map winners to codes for coloring
+code_map = {a:i for i,a in enumerate(sorted(topic_sec_author["author"].unique()))}
+win_mat = winners.pivot(index="product", columns="section_index", values="winner").sort_index()
+code_mat = win_mat.replace(code_map)
+plt.figure(figsize=(max(6, 0.6*code_mat.shape[1]+2), 0.45*code_mat.shape[0]+2.5))
+cmap = sns.color_palette("Set2", n_colors=len(code_map))
+sns.heatmap(code_mat, annot=win_mat, fmt="", cmap=cmap, cbar=False)
+plt.title("Winner map (best author per product × section)")
+plt.ylabel("Product"); plt.xlabel("Section")
+plt.tight_layout()
+plt.savefig("/content/figs/heatmap_winner.png")
+plt.close()
+
+print("Saved figures to /content/figs")
+
+# Quick inline previews
+display(sec_summary)
+display(stats_table.head(20))
+display(winner_counts.sort_values(["section_index","wins"], key=lambda s: s.astype(str)).head(50))
+if 'icc_table' in locals() and icc_table is not None:
+    display(icc_table)
+
